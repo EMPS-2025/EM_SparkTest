@@ -16,9 +16,12 @@ if PROJECT_ROOT not in sys.path:
 
 import traceback
 from datetime import date, datetime
-from dataclasses import replace
+import dataclasses
 from typing import Dict, List, Any, Optional, Tuple
 import json
+
+# Disable Chainlit persistence before importing Chainlit to avoid DB init errors
+os.environ["CHAINLIT_DISABLE_PERSISTENCE"] = "true"
 
 import chainlit as cl
 from openai import OpenAI
@@ -34,12 +37,40 @@ from utils.formatters import (
     label_slot_ranges,
 )
 
+PURCHASE_BID_KEYS = [
+    'purchase_bid_avg',
+    'purchase_bid',
+    'purchase_bid_sum',
+    'purchase_bid_total_mw',
+    'purchase_bid_mw_sum',
+    'purchase_bid_mw_total',
+    'purchase_bid_txt',
+    'purchase_bid_mw',
+    'buy_bid_avg',
+    'buy_bid_sum',
+    'buy_bid_total_mw',
+    'buy_bid_mw_sum',
+]
+
+SELL_BID_KEYS = [
+    'sell_bid_avg',
+    'sell_bid',
+    'sell_bid_sum',
+    'sell_bid_total_mw',
+    'sell_bid_mw_sum',
+    'sell_bid_mw_total',
+    'sell_bid_txt',
+    'sell_bid_mw',
+    'sell_offer_avg',
+    'sell_offer_sum',
+    'sell_offer_total_mw',
+    'sell_offer_mw_sum',
+]
+
 
 # ═══════════════════════════════════════════════════════════════
 # DISABLE CHAINLIT PERSISTENCE
 # ═══════════════════════════════════════════════════════════════
-
-os.environ["CHAINLIT_DISABLE_PERSISTENCE"] = "true"
 
 def disable_chainlit_data_layer():
     try:
@@ -278,7 +309,17 @@ def filter_rows_by_time(rows: List[Dict[str, Any]], spec) -> List[Dict[str, Any]
     allowed_hours = set(spec.hours or range(1, 25))
     filtered = []
     for row in rows:
-        block = _extract_int(row, ['block_index', 'block_no', 'delivery_block', 'hour_block'])
+        block = _extract_int(
+            row,
+            [
+                'block_index',
+                'block_no',
+                'delivery_block',
+                'hour_block',
+                'hour_txt',
+                'time_block_txt',
+            ],
+        )
         if block in allowed_hours:
             filtered.append(row)
     return filtered
@@ -299,7 +340,15 @@ def compute_market_metrics(rows: List[Dict[str, Any]], spec) -> Dict[str, Any]:
 
     for row in rows:
         duration_min = float(row.get('duration_min') or default_duration)
-        price_mwh = _extract_float(row, ['price_avg_rs_per_mwh', 'price_rs_per_mwh', 'price_rs_per_mw'])
+        price_mwh = _extract_float(
+            row,
+            [
+                'price_avg_rs_per_mwh',
+                'price_rs_per_mwh',
+                'price_rs_per_mw',
+                'mcp_rs_per_mwh',
+            ],
+        )
         price_kwh = price_mwh / 1000.0 if price_mwh else 0.0
         duration_hours = duration_min / 60.0
 
@@ -307,10 +356,13 @@ def compute_market_metrics(rows: List[Dict[str, Any]], spec) -> Dict[str, Any]:
         price_weight += price_kwh * duration_min
         minute_total += duration_min
 
-        scheduled_mw = _extract_float(row, ['scheduled_mw_sum', 'scheduled_mw', 'cleared_volume_mw'])
-        purchase_bid = _extract_float(row, ['purchase_bid_avg', 'purchase_bid', 'purchase_bid_sum'])
-        sell_bid = _extract_float(row, ['sell_bid_avg', 'sell_bid', 'sell_bid_sum'])
-        mcv = _extract_float(row, ['mcv_sum', 'mcv'])
+        scheduled_mw = _extract_float(
+            row,
+            ['scheduled_mw_sum', 'scheduled_mw', 'cleared_volume_mw', 'scheduled_mw_txt'],
+        )
+        purchase_bid = _extract_float(row, PURCHASE_BID_KEYS)
+        sell_bid = _extract_float(row, SELL_BID_KEYS)
+        mcv = _extract_float(row, ['mcv_sum', 'mcv', 'mcv_txt'])
 
         volume_mwh += scheduled_mw * duration_hours
         purchase_total += purchase_bid * duration_hours
@@ -356,6 +408,20 @@ def _extract_float(row: Dict[str, Any], keys: List[str], default: float = 0.0) -
             return float(value)
         except (TypeError, ValueError):
             continue
+    lowered_items = list(row.items())
+    for key in keys:
+        target = key.lower()
+        for actual_key, value in lowered_items:
+            if value is None:
+                continue
+            actual_key_str = str(actual_key)
+            if actual_key_str.lower() == target:
+                continue
+            if target in actual_key_str.lower():
+                try:
+                    return float(value)
+                except (TypeError, ValueError):
+                    continue
     return default
 
 
@@ -555,7 +621,7 @@ def format_date_range(start: date, end: date) -> str:
 
 
 def clone_spec_for_market(spec, market: str):
-    return replace(spec, market=market)
+    return dataclasses.replace(spec, market=market)
 
 
 def shift_spec_by_year(spec, years: int):
@@ -565,7 +631,7 @@ def shift_spec_by_year(spec, years: int):
     end = _shift_date_safe(spec.end_date, years)
     if not start or not end:
         return None
-    return replace(spec, start_date=start, end_date=end)
+    return dataclasses.replace(spec, start_date=start, end_date=end)
 
 
 def _shift_date_safe(original: date, years: int) -> Optional[date]:

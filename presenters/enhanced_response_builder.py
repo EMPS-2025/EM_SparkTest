@@ -11,8 +11,21 @@ MARKET_META = {
 }
 
 
+def _render_snapshot_kpi(label: str, value: str) -> str:
+    """Standalone helper to avoid attribute loss during hot reloads."""
+    return f"""
+<div class="rounded-2xl border border-slate-100 p-4">
+  <p class="text-xs text-slate-500">{label}</p>
+  <p class="text-lg font-semibold">{value}</p>
+</div>
+"""
+
+
 class EnhancedResponseBuilder:
     """Render rich HTML sections that match the desired UI."""
+
+    # NOTE: legacy attribute kept for compatibility with existing imports
+    _snapshot_kpi = staticmethod(_render_snapshot_kpi)
 
     def build_overview_header(
         self,
@@ -61,7 +74,7 @@ class EnhancedResponseBuilder:
       <p class="text-xs text-slate-400">{time_window}</p>
     </div>
   </div>
-  <div class="grid grid-cols-1 sm:grid-cols-3 gap-4">
+    <div class="grid grid-cols-1 sm:grid-cols-3 gap-4">
     {self._snapshot_kpi("TWAP Price", self._format_currency(twap) + " /kWh")}
     {self._snapshot_kpi("Min / Max Block", f"{self._format_currency(min_price)} / {self._format_currency(max_price)} /kWh")}
     {self._snapshot_kpi("Total Cleared Volume", f"{total_volume_gwh:.1f} GWh")}
@@ -171,14 +184,6 @@ class EnhancedResponseBuilder:
         return f"""
 <div class="font-['Inter'] text-slate-900 bg-slate-50/60 rounded-[32px] p-6 space-y-6">
   {body}
-</div>
-"""
-
-    def _snapshot_kpi(self, label: str, value: str) -> str:
-        return f"""
-<div class="rounded-2xl border border-slate-100 p-4">
-  <p class="text-xs text-slate-500">{label}</p>
-  <p class="text-lg font-semibold">{value}</p>
 </div>
 """
 
