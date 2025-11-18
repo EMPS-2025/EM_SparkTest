@@ -26,6 +26,7 @@ from openai import OpenAI
 # Import modules
 from core.config import Config
 from core.database import DatabaseManager
+from parsers.bulletproof_parser import BulletproofParser
 from parsers.smart_parser import SmartParser
 from presenters.enhanced_response_builder import EnhancedResponseBuilder
 from utils.formatters import (
@@ -58,7 +59,11 @@ disable_chainlit_data_layer()
 
 config = Config()
 db = DatabaseManager(config)
-parser = SmartParser(config)
+
+parser = BulletproofParser(config)
+
+#parser = SmartParser(config)
+
 response_builder = EnhancedResponseBuilder()
 
 # Initialize OpenAI client
