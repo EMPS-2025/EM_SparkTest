@@ -7,6 +7,43 @@ from typing import List, Dict, Optional
 from datetime import date
 
 
+BID_FIELD_KEYWORDS = ("purchase_bid", "sell_bid", "buy_bid", "sell_offer")
+
+
+def _as_float(value):
+    """Best-effort conversion for text columns (e.g. *_txt)."""
+    if value is None:
+        return 0.0
+    if isinstance(value, (int, float)):
+        return float(value)
+    if isinstance(value, str):
+        cleaned = value.strip()
+        if not cleaned:
+            return 0.0
+        for token in (",", "₹", "rs", "RS", "Rs", "MW", "mw", "kWh", "MWh"):
+            cleaned = cleaned.replace(token, "")
+        try:
+            return float(cleaned)
+        except ValueError:
+            return 0.0
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _coerce_bid_fields(row: Dict) -> None:
+    """Ensure any bid/offer related fields are safe floats."""
+    for key, value in list(row.items()):
+        key_lower = str(key).lower()
+        if not any(token in key_lower for token in BID_FIELD_KEYWORDS):
+            continue
+        try:
+            row[key] = _as_float(value)
+        except (TypeError, ValueError):
+            row[key] = 0.0
+
+
 class DatabaseManager:
     """Manages database connections and queries."""
     
@@ -58,18 +95,33 @@ class DatabaseManager:
                           f"Scheduled={rows[0].get('scheduled_mw_sum')}, "
                           f"PurchaseBid={rows[0].get('purchase_bid_avg')}, "
                           f"SellBid={rows[0].get('sell_bid_avg')}")
+                    bid_keys = [
+                        str(k)
+                        for k in rows[0].keys()
+                        if any(token in str(k).lower() for token in BID_FIELD_KEYWORDS)
+                    ]
+                    if bid_keys:
+                        print(f"  Bid fields present: {', '.join(sorted(bid_keys))}")
                 else:
                     print(f"⚠️  No hourly data found for {market} on {start_date}")
-                
+
                 # Ensure numeric fields with correct names
                 for row in rows:
-                    row['price_avg_rs_per_mwh'] = float(row.get('price_avg_rs_per_mwh', 0) or 0)
-                    row['scheduled_mw_sum'] = float(row.get('scheduled_mw_sum', 0) or 0)
+                    row['price_avg_rs_per_mwh'] = _as_float(
+                        row.get('price_avg_rs_per_mwh', row.get('mcp_rs_per_mwh', 0))
+                    )
+                    row['scheduled_mw_sum'] = _as_float(
+                        row.get('scheduled_mw_sum', row.get('scheduled_mw_txt', row.get('scheduled_mw', 0)))
+                    )
                     row['duration_min'] = int(row.get('duration_min', 60) or 60)
-                    row['purchase_bid_avg'] = float(row.get('purchase_bid_avg', 0) or 0)
-                    row['sell_bid_avg'] = float(row.get('sell_bid_avg', 0) or 0)
-                    row['mcv_sum'] = float(row.get('mcv_sum', 0) or 0)
-                
+                    row['purchase_bid_avg'] = _as_float(row.get('purchase_bid_avg'))
+                    row['sell_bid_avg'] = _as_float(row.get('sell_bid_avg'))
+                    row['mcv_sum'] = _as_float(row.get('mcv_sum', row.get('mcv_txt', 0)))
+                    for alias in ('purchase_bid_txt', 'sell_bid_txt', 'mcv_txt'):
+                        if alias in row:
+                            row[alias] = _as_float(row[alias])
+                    _coerce_bid_fields(row)
+
                 return rows
     
     def fetch_quarter(
@@ -105,16 +157,19 @@ class DatabaseManager:
                     print(f"✓ Fetched {len(rows)} quarter rows for {market}")
                 else:
                     print(f"⚠️  No quarter data found for {market} on {start_date}")
-                
+
                 # Ensure numeric fields
                 for row in rows:
-                    row['price_rs_per_mwh'] = float(row.get('price_rs_per_mwh', 0) or 0)
-                    row['scheduled_mw'] = float(row.get('scheduled_mw', 0) or 0)
+                    row['price_rs_per_mwh'] = _as_float(
+                        row.get('price_rs_per_mwh', row.get('mcp_rs_per_mwh', 0))
+                    )
+                    row['scheduled_mw'] = _as_float(row.get('scheduled_mw', row.get('scheduled_mw_txt', 0)))
                     row['duration_min'] = int(row.get('duration_min', 15) or 15)
-                    row['purchase_bid'] = float(row.get('purchase_bid', 0) or 0)
-                    row['sell_bid'] = float(row.get('sell_bid', 0) or 0)
-                    row['mcv'] = float(row.get('mcv', 0) or 0)
-                
+                    row['purchase_bid'] = _as_float(row.get('purchase_bid', row.get('purchase_bid_txt', 0)))
+                    row['sell_bid'] = _as_float(row.get('sell_bid', row.get('sell_bid_txt', 0)))
+                    row['mcv'] = _as_float(row.get('mcv', row.get('mcv_txt', 0)))
+                    _coerce_bid_fields(row)
+
                 return rows
     
     # ═══════════════════════════════════════════════════════════
