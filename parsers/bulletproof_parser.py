@@ -1,283 +1,221 @@
 # parsers/bulletproof_parser.py
-"""
-Ultra-robust parser that ALWAYS understands common queries.
-Guaranteed to parse: "DAM rate for 14 Nov 2025" and similar queries.
-"""
+"""Deterministic query parser that handles every supported phrasing."""
+
+from __future__ import annotations
 
 import re
-from datetime import date, timedelta
-from typing import List, Tuple, Optional
+from datetime import date
+from typing import List, Tuple
+
 from core.models import QuerySpec
+from parsers.date_parser import DateParser
+from parsers.time_parser import TimeParser
+from utils.text_utils import normalize_text
 
 
 class BulletproofParser:
-    """Parser that never fails on common queries."""
-    
-    MONTHS = {
-        "jan": 1, "january": 1,
-        "feb": 2, "february": 2,
-        "mar": 3, "march": 3,
-        "apr": 4, "april": 4,
-        "may": 5,
-        "jun": 6, "june": 6,
-        "jul": 7, "july": 7,
-        "aug": 8, "august": 8,
-        "sep": 9, "sept": 9, "september": 9,
-        "oct": 10, "october": 10,
-        "nov": 11, "november": 11,
-        "dec": 12, "december": 12
-    }
-    
+    """High-confidence parser with layered deterministic fallbacks."""
+
+    def __init__(self, config):
+        self.config = config
+        self.date_parser = DateParser()
+        self.time_parser = TimeParser()
+
+    # ------------------------------------------------------------------
+    # Public API
+    # ------------------------------------------------------------------
     def parse(self, query: str) -> List[QuerySpec]:
-        """
-        Parse query with multiple fallback strategies.
-        GUARANTEED to parse common queries.
-        """
-        query = query.strip().lower()
-        
-        # Strategy 1: Direct pattern matching (fastest)
-        specs = self._parse_direct(query)
-        if specs:
-            return specs
-        
-        # Strategy 2: Extract components individually
-        specs = self._parse_components(query)
-        if specs:
-            return specs
-        
-        # Strategy 3: Ultra-lenient fallback
-        specs = self._parse_lenient(query)
-        if specs:
-            return specs
-        
-        # Strategy 4: Default to today
-        print(f"⚠️  Could not parse '{query}', defaulting to today")
-        return [self._default_spec()]
-    
-    def _parse_direct(self, query: str) -> Optional[List[QuerySpec]]:
-        """Direct pattern matching for common queries."""
-        
-        # Pattern: "DAM/GDAM/RTM rate for DD Mon YYYY"
-        m = re.search(
-            r'(dam|gdam|rtm)\s+(?:rate|price)?\s*(?:for)?\s*(\d{1,2})\s+(jan|feb|mar|apr|may|jun|jul|aug|sep|sept|oct|nov|dec)\s+(\d{4})',
-            query
+        """Parse user query into one or more QuerySpec objects."""
+
+        if not query or not query.strip():
+            return [self._default_spec()]
+
+        normalized = normalize_text(query)
+        markets = self._extract_markets(normalized)
+        stat = self._detect_stat(normalized)
+        periods = self._extract_periods(normalized)
+        time_groups = self.time_parser.parse_time_groups(normalized)
+
+        if not time_groups:
+            time_groups = [
+                {"granularity": "hour", "hours": list(range(1, 25)), "slots": None}
+            ]
+
+        specs: List[QuerySpec] = []
+        for market in markets:
+            for start_date, end_date in periods:
+                for group in time_groups:
+                    specs.append(
+                        QuerySpec(
+                            market=market,
+                            start_date=start_date,
+                            end_date=end_date,
+                            granularity=group["granularity"],
+                            hours=group.get("hours"),
+                            slots=group.get("slots"),
+                            stat=stat,
+                        )
+                    )
+
+        return self._deduplicate(specs) if specs else [self._default_spec()]
+
+    # ------------------------------------------------------------------
+    # Component extractors
+    # ------------------------------------------------------------------
+    def _extract_markets(self, text: str) -> List[str]:
+        """Return ordered list of markets mentioned in the query."""
+
+        locations: List[Tuple[int, str]] = []
+        patterns = [
+            (r"\brtm\b|real\s*time", "RTM"),
+            (r"\bgdam\b|green\s*day", "GDAM"),
+            (r"\bdam\b|day\s*-?ahead", "DAM"),
+        ]
+
+        for pattern, label in patterns:
+            match = re.search(pattern, text, re.I)
+            if match:
+                locations.append((match.start(), label))
+
+        locations.sort(key=lambda item: item[0])
+        ordered = [label for _, label in locations]
+        return ordered or ["DAM"]
+
+    def _detect_stat(self, text: str) -> str:
+        """Infer statistic type requested by the user."""
+
+        lower = text.lower()
+        if re.search(r"\b(vwap|weighted)\b", lower):
+            return "vwap"
+        if re.search(r"\bdaily\s+(avg|average)\b", lower):
+            return "daily_avg"
+        if re.search(r"\b(list|table|rows|detailed)\b", lower):
+            return "list"
+        if re.search(r"\b(avg|average|mean|twap)\b", lower):
+            return "twap"
+
+        return getattr(self.config, "DEFAULT_STAT", "twap")
+
+    def _extract_periods(self, text: str) -> List[Tuple[date, date]]:
+        """Extract one or many date periods from the query."""
+
+        periods = self.date_parser.parse_periods(text)
+        if not periods:
+            start, end = self.date_parser.parse_single_range(text)
+            if start and end:
+                periods = [(start, end)]
+
+        if not periods:
+            periods = self._extract_loose_dates(text)
+
+        if not periods:
+            today = date.today()
+            periods = [(today, today)]
+
+        return periods
+
+    def _extract_loose_dates(self, text: str) -> List[Tuple[date, date]]:
+        """Fallback: find every standalone '14 Nov 2025' like token."""
+
+        matches = re.findall(
+            r"\b(\d{1,2})\s+(jan|feb|mar|apr|may|jun|jul|aug|sep|sept|oct|nov|dec)[a-z]*\s+(\d{2,4})\b",
+            text,
+            flags=re.I,
         )
-        if m:
-            market = m.group(1).upper()
-            day = int(m.group(2))
-            month = self.MONTHS[m.group(3)]
-            year = int(m.group(4))
-            
+
+        periods: List[Tuple[date, date]] = []
+        for day_str, month_str, year_str in matches:
             try:
-                d = date(year, month, day)
-                return [self._build_spec(market, d, d, query)]
-            except ValueError:
-                pass
-        
-        # Pattern: "DAM/GDAM/RTM today"
-        if re.search(r'\b(dam|gdam|rtm)\b.*\btoday\b', query):
-            market = self._extract_market(query)
-            d = date.today()
-            return [self._build_spec(market, d, d, query)]
-        
-        # Pattern: "DAM/GDAM/RTM yesterday"
-        if re.search(r'\b(dam|gdam|rtm)\b.*\byesterday\b', query):
-            market = self._extract_market(query)
-            d = date.today() - timedelta(days=1)
-            return [self._build_spec(market, d, d, query)]
-        
-        return None
-    
-    def _parse_components(self, query: str) -> Optional[List[QuerySpec]]:
-        """Extract components individually and combine."""
-        
-        # Extract market
-        market = self._extract_market(query)
-        
-        # Extract date
-        start_date, end_date = self._extract_date(query)
-        if not start_date:
-            return None
-        
-        # Extract time ranges
-        hours, slots = self._extract_time_ranges(query)
-        
-        return [QuerySpec(
-            market=market,
-            start_date=start_date,
-            end_date=end_date,
-            granularity="hour" if hours else "quarter" if slots else "hour",
-            hours=hours or list(range(1, 25)),
-            slots=slots,
-            stat="twap"
-        )]
-    
-    def _parse_lenient(self, query: str) -> Optional[List[QuerySpec]]:
-        """Ultra-lenient parsing - find ANY date in the query."""
-        
-        market = self._extract_market(query)
-        
-        # Try to find ANY date pattern
-        # Pattern: DD Mon YYYY
-        m = re.search(r'(\d{1,2})\s+(jan|feb|mar|apr|may|jun|jul|aug|sep|sept|oct|nov|dec)[a-z]*\s+(\d{4})', query)
-        if m:
+                month = DateParser.MONTHS[month_str.lower()[:3]]
+                year = self._normalize_year(year_str)
+                day = int(day_str)
+                periods.append((date(year, month, day), date(year, month, day)))
+            except Exception:
+                continue
+
+        if periods:
+            return periods
+
+        # Handle "Nov 2024, Nov 2025" style without explicit ranges.
+        month_year = re.findall(
+            r"\b(jan|feb|mar|apr|may|jun|jul|aug|sep|sept|oct|nov|dec)[a-z]*\s+(\d{4})\b",
+            text,
+            flags=re.I,
+        )
+
+        for month_str, year_str in month_year:
             try:
-                day = int(m.group(1))
-                month = self.MONTHS[m.group(2)]
-                year = int(m.group(3))
-                d = date(year, month, day)
-                
-                hours, slots = self._extract_time_ranges(query)
-                
-                return [QuerySpec(
-                    market=market,
-                    start_date=d,
-                    end_date=d,
-                    granularity="hour" if hours else "quarter" if slots else "hour",
-                    hours=hours or list(range(1, 25)),
-                    slots=slots,
-                    stat="twap"
-                )]
-            except ValueError:
-                pass
-        
-        # Try Mon YYYY (full month)
-        m = re.search(r'\b(jan|feb|mar|apr|may|jun|jul|aug|sep|sept|oct|nov|dec)[a-z]*\s+(\d{4})\b', query)
-        if m:
-            try:
-                month = self.MONTHS[m.group(1)]
-                year = int(m.group(2))
+                month = DateParser.MONTHS[month_str.lower()[:3]]
+                year = int(year_str)
                 start = date(year, month, 1)
-                
                 import calendar
+
                 last_day = calendar.monthrange(year, month)[1]
                 end = date(year, month, last_day)
-                
-                return [self._build_spec(market, start, end, query)]
-            except ValueError:
-                pass
-        
-        return None
-    
-    def _extract_market(self, query: str) -> str:
-        """Extract market type from query."""
-        if re.search(r'\brtm\b', query):
-            return "RTM"
-        if re.search(r'\bgdam\b', query):
-            return "GDAM"
-        return "DAM"
-    
-    def _extract_date(self, query: str) -> Tuple[Optional[date], Optional[date]]:
-        """Extract date from query."""
-        
-        # Relative dates
-        if 'today' in query:
-            d = date.today()
-            return d, d
-        
-        if 'yesterday' in query:
-            d = date.today() - timedelta(days=1)
-            return d, d
-        
-        # DD Mon YYYY
-        m = re.search(r'(\d{1,2})\s+(jan|feb|mar|apr|may|jun|jul|aug|sep|sept|oct|nov|dec)[a-z]*\s+(\d{4})', query)
-        if m:
-            try:
-                day = int(m.group(1))
-                month = self.MONTHS[m.group(2)]
-                year = int(m.group(3))
-                d = date(year, month, day)
-                return d, d
-            except ValueError:
-                pass
-        
-        # Mon YYYY
-        m = re.search(r'\b(jan|feb|mar|apr|may|jun|jul|aug|sep|sept|oct|nov|dec)[a-z]*\s+(\d{4})\b', query)
-        if m:
-            try:
-                import calendar
-                month = self.MONTHS[m.group(1)]
-                year = int(m.group(2))
-                start = date(year, month, 1)
-                last_day = calendar.monthrange(year, month)[1]
-                end = date(year, month, last_day)
-                return start, end
-            except ValueError:
-                pass
-        
-        return None, None
-    
-    def _extract_time_ranges(self, query: str) -> Tuple[Optional[List[int]], Optional[List[int]]]:
-        """Extract time ranges from query."""
-        
-        # Hours: "8-9 hrs" or "8-9 hours"
-        m = re.search(r'(\d{1,2})\s*-\s*(\d{1,2})\s*(?:hrs?|hours?)', query)
-        if m:
-            start = int(m.group(1))
-            end = int(m.group(2))
-            hours = list(range(start, end + 1))
-            return hours, None
-        
-        # Slots: "20-50 slots"
-        m = re.search(r'(\d{1,2})\s*-\s*(\d{1,2})\s*(?:slots?|blocks?)', query)
-        if m:
-            start = int(m.group(1))
-            end = int(m.group(2))
-            slots = list(range(start, end + 1))
-            return None, slots
-        
-        return None, None
-    
-    def _build_spec(self, market: str, start: date, end: date, query: str) -> QuerySpec:
-        """Build QuerySpec with time ranges if present."""
-        hours, slots = self._extract_time_ranges(query)
-        
-        return QuerySpec(
-            market=market,
-            start_date=start,
-            end_date=end,
-            granularity="hour" if hours else "quarter" if slots else "hour",
-            hours=hours or list(range(1, 25)),
-            slots=slots,
-            stat="twap"
-        )
-    
+                periods.append((start, end))
+            except Exception:
+                continue
+
+        return periods
+
+    # ------------------------------------------------------------------
+    # Helpers
+    # ------------------------------------------------------------------
+    def _deduplicate(self, specs: List[QuerySpec]) -> List[QuerySpec]:
+        seen = set()
+        unique: List[QuerySpec] = []
+
+        for spec in specs:
+            key = (
+                spec.market,
+                spec.start_date,
+                spec.end_date,
+                spec.granularity,
+                tuple(spec.hours or []),
+                tuple(spec.slots or []),
+                spec.stat,
+            )
+            if key not in seen:
+                seen.add(key)
+                unique.append(spec)
+
+        return unique
+
     def _default_spec(self) -> QuerySpec:
-        """Return default spec for unparseable queries."""
+        today = date.today()
         return QuerySpec(
             market="DAM",
-            start_date=date.today(),
-            end_date=date.today(),
+            start_date=today,
+            end_date=today,
             granularity="hour",
             hours=list(range(1, 25)),
             slots=None,
-            stat="twap"
+            stat="twap",
         )
 
+    @staticmethod
+    def _normalize_year(year_str: str) -> int:
+        year = int(year_str)
+        if year < 100:
+            year += 2000
+        return year
 
-# ═══════════════════════════════════════════════════════════════
-# Test the parser
-# ═══════════════════════════════════════════════════════════════
 
 if __name__ == "__main__":
-    parser = BulletproofParser()
-    
-    test_queries = [
+    # Quick smoke test
+    class _Cfg:
+        DEFAULT_STAT = "twap"
+
+    parser = BulletproofParser(_Cfg())
+    tests = [
         "DAM rate for 14 Nov 2025",
-        "GDAM for 15 Nov 2024",
-        "RTM today",
-        "DAM yesterday",
-        "DAM rate for 14 Nov 2025 for 8-9 hrs",
-        "GDAM for 15-24 hrs for 17 Oct 2025",
-        "RTM for 20-50 slots on 31 Oct 2025",
+        "GDAM 6-8 and 12-14 hours for 31/10/2025",
+        "RTM 20-50 slots on 31 Oct 2025",
+        "Compare DAM and GDAM for Nov 2022, 2023, 2024",
+        "RTM yesterday",
+        "Prices between 12 Nov 2024 to 15 Nov 2024 8-9 hrs",
     ]
-    
-    print("="*70)
-    print("TESTING BULLETPROOF PARSER")
-    print("="*70)
-    
-    for query in test_queries:
-        print(f"\nQuery: {query}")
-        specs = parser.parse(query)
-        for spec in specs:
-            print(f"  ✓ {spec}")
+    for q in tests:
+        print(q)
+        for spec in parser.parse(q):
+            print("  ", spec)

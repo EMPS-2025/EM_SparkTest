@@ -209,7 +209,6 @@ Return ONLY valid JSON. No explanations."""
                     {"role": "user", "content": f"Parse this query: {user_query}"}
                 ],
                 response_format={"type": "json_object"},
-                temperature=0.1
             )
             
             content = response.choices[0].message.content
