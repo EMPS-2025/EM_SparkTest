@@ -21,6 +21,11 @@ def _render_snapshot_kpi(label: str, value: str) -> str:
 """
 
 
+def _format_currency_value(value: float) -> str:
+    """Module-level helper retained across hot reloads."""
+    return f"₹{value:.2f}"
+
+
 class EnhancedResponseBuilder:
     """Render rich HTML sections that match the desired UI."""
 
@@ -205,6 +210,11 @@ class EnhancedResponseBuilder:
             f"</tr>"
         )
 
+    def __getattr__(self, name: str):
+        if name == "_format_currency":
+            return _format_currency_value
+        raise AttributeError(name)
+
     def _tightness_badge(self, ratio: float) -> str:
         if ratio > 1.05:
             return "Tight"
@@ -213,7 +223,7 @@ class EnhancedResponseBuilder:
         return "Loose"
 
     def _format_currency(self, value: float) -> str:
-        return f"₹{value:.2f}"
+        return _format_currency_value(value)
 
     def _format_delta(self, current: float, previous: float) -> str:
         if previous <= 0:
