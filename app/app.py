@@ -27,6 +27,7 @@ from openai import OpenAI
 from core.config import Config
 from core.database import DatabaseManager
 from parsers.bulletproof_parser import BulletproofParser
+from parsers.smart_parser import SmartParser
 from presenters.enhanced_response_builder import EnhancedResponseBuilder
 from utils.formatters import (
     label_hour_ranges,
@@ -58,7 +59,11 @@ disable_chainlit_data_layer()
 
 config = Config()
 db = DatabaseManager(config)
+
 parser = BulletproofParser(config)
+
+#parser = SmartParser(config)
+
 response_builder = EnhancedResponseBuilder()
 
 # Initialize OpenAI client
@@ -466,6 +471,7 @@ Provide four crisp insights covering price trends, volume signals, GDAM vs DAM p
                 {"role": "system", "content": "You are an expert energy market analyst providing concise, data-driven insights."},
                 {"role": "user", "content": prompt},
             ],
+            temperature=0.6,
             max_tokens=320,
         )
 
