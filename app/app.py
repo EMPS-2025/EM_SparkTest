@@ -16,7 +16,8 @@ if PROJECT_ROOT not in sys.path:
 
 import traceback
 from datetime import date, datetime
-from typing import Dict, List, Any, Optional
+from dataclasses import replace
+from typing import Dict, List, Any, Optional, Tuple
 import json
 
 import chainlit as cl
@@ -25,8 +26,12 @@ from openai import OpenAI
 # Import modules
 from core.config import Config
 from core.database import DatabaseManager
-from parsers.bulletproof_parser import BulletproofParser
-from presenters.enhanced_response_builder import EnhancedResponseBuilder, format_time_range
+from parsers.smart_parser import SmartParser
+from presenters.enhanced_response_builder import EnhancedResponseBuilder
+from utils.formatters import (
+    label_hour_ranges,
+    label_slot_ranges,
+)
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -53,7 +58,7 @@ disable_chainlit_data_layer()
 
 config = Config()
 db = DatabaseManager(config)
-parser = BulletproofParser()
+parser = SmartParser(config)
 response_builder = EnhancedResponseBuilder()
 
 # Initialize OpenAI client
@@ -123,31 +128,32 @@ async def handle_message(msg: cl.Message):
         await progress_msg.update()
         
         # Fetch data for all three markets (for comparison)
-        all_market_data = {}
+        selection_details = describe_time_selection(primary_spec)
+        all_market_data: Dict[str, Dict[str, Any]] = {}
+        all_market_prev_year: Dict[str, Optional[Dict[str, Any]]] = {}
+
         for market in ["DAM", "GDAM", "RTM"]:
-            from core.models import QuerySpec
-            market_spec = QuerySpec(
-                market=market,
-                start_date=primary_spec.start_date,
-                end_date=primary_spec.end_date,
-                granularity=primary_spec.granularity,
-                hours=primary_spec.hours,
-                slots=primary_spec.slots,
-                stat=primary_spec.stat
-            )
+            market_spec = clone_spec_for_market(primary_spec, market)
             all_market_data[market] = fetch_market_data(market_spec)
-        
-        primary_data = all_market_data[primary_spec.market]
-        
+
+            prev_year_spec = shift_spec_by_year(market_spec, -1)
+            all_market_prev_year[market] = (
+                fetch_market_data(prev_year_spec) if prev_year_spec else None
+            )
+
+        primary_data = all_market_data.get(primary_spec.market, {})
+
         # Update progress
         progress_msg.content = "🤖 Generating AI insights..."
         await progress_msg.update()
-        
+
         # Build response with OpenAI insights
         response = await build_complete_response(
             primary_spec,
             primary_data,
             all_market_data,
+            all_market_prev_year,
+            selection_details,
             user_query
         )
         
@@ -177,285 +183,393 @@ async def handle_message(msg: cl.Message):
 # ═══════════════════════════════════════════════════════════════
 
 def fetch_market_data(spec) -> Dict[str, Any]:
-    """Fetch and process market data - FIXED with correct aggregations."""
-    
+    """Fetch market data for the requested period and compute KPIs."""
+
+    if not spec:
+        return empty_market_payload()
+
     try:
-        # Fetch hourly data
-        rows = db.fetch_hourly(
-            spec.market,
-            spec.start_date,
-            spec.end_date,
-            None,
-            None
-        )
-        
+        if spec.granularity == "quarter" or (spec.slots and len(spec.slots) > 0):
+            rows = db.fetch_quarter(
+                spec.market,
+                spec.start_date,
+                spec.end_date,
+                None,
+                None,
+            )
+        else:
+            rows = db.fetch_hourly(
+                spec.market,
+                spec.start_date,
+                spec.end_date,
+                None,
+                None,
+            )
+
         if not rows:
-            print(f"⚠️  No data found for {spec.market} on {spec.start_date}")
-            return {
-                'twap': 0,
-                'min_price': 0,
-                'max_price': 0,
-                'total_volume_gwh': 0,
-                'purchase_bid_total_mw': 0,
-                'sell_bid_total_mw': 0,
-                'scheduled_total_mw': 0,
-                'mcv_total_mw': 0,
-                'rows': []
-            }
-        
-        # Calculate metrics - FIXED
-        prices = [float(r['price_avg_rs_per_mwh']) / 1000.0 for r in rows if r.get('price_avg_rs_per_mwh')]
-        
-        twap = sum(prices) / len(prices) if prices else 0
-        min_price = min(prices) if prices else 0
-        max_price = max(prices) if prices else 0
-        
-        # Volume calculation (MW * hours) -> MWh -> GWh
-        total_volume_mwh = sum(
-            float(r.get('scheduled_mw_sum', 0) or 0)
-            for r in rows
+            print(f"⚠️  No data found for {spec.market} between {spec.start_date} and {spec.end_date}")
+            return empty_market_payload()
+
+        filtered_rows = filter_rows_by_time(rows, spec)
+        if not filtered_rows:
+            print(f"⚠️  No rows left after filtering time selection for {spec.market}")
+            return empty_market_payload()
+
+        metrics = compute_market_metrics(filtered_rows, spec)
+        metrics['rows'] = filtered_rows
+
+        print(
+            "✓ Processed {market}: TWAP=₹{twap:.4f}, Vol={vol:.2f} GWh, Purchase={purchase:,.0f} MW, "
+            "Sell={sell:,.0f} MW".format(
+                market=spec.market,
+                twap=metrics['twap'],
+                vol=metrics['total_volume_gwh'],
+                purchase=metrics['purchase_bid_total_mw'],
+                sell=metrics['sell_bid_total_mw'],
+            )
         )
-        total_volume_gwh = total_volume_mwh / 1000.0
-        
-        # FIXED: Bids and MCV should be SUMMED, not averaged!
-        purchase_bid_total = sum(float(r.get('purchase_bid_avg', 0) or 0) for r in rows)
-        sell_bid_total = sum(float(r.get('sell_bid_avg', 0) or 0) for r in rows)
-        mcv_total = sum(float(r.get('mcv_sum', 0) or 0) for r in rows)
-        scheduled_total = sum(float(r.get('scheduled_mw_sum', 0) or 0) for r in rows)
-        
-        print(f"✓ Processed {spec.market}: TWAP=₹{twap:.4f}, Vol={total_volume_gwh:.2f}GWh, "
-              f"PurchaseBid={purchase_bid_total:.0f}MW, SellBid={sell_bid_total:.0f}MW")
-        
-        return {
-            'twap': twap,
-            'min_price': min_price,
-            'max_price': max_price,
-            'total_volume_gwh': total_volume_gwh,
-            'purchase_bid_total_mw': purchase_bid_total,
-            'sell_bid_total_mw': sell_bid_total,
-            'scheduled_total_mw': scheduled_total,
-            'mcv_total_mw': mcv_total,
-            'rows': rows
-        }
-        
+
+        return metrics
+
     except Exception as e:
-        print(f"❌ Error fetching data for {spec.market}: {e}")
+        print(f"❌ Error fetching data for {getattr(spec, 'market', 'N/A')}: {e}")
         traceback.print_exc()
-        return {
-            'twap': 0,
-            'min_price': 0,
-            'max_price': 0,
-            'total_volume_gwh': 0,
-            'purchase_bid_total_mw': 0,
-            'sell_bid_total_mw': 0,
-            'scheduled_total_mw': 0,
-            'mcv_total_mw': 0,
-            'rows': []
-        }
+        return empty_market_payload()
+
+
+def empty_market_payload() -> Dict[str, Any]:
+    """Return a default payload when data is missing."""
+    return {
+        'twap': 0.0,
+        'min_price': 0.0,
+        'max_price': 0.0,
+        'total_volume_gwh': 0.0,
+        'purchase_bid_total_mw': 0.0,
+        'sell_bid_total_mw': 0.0,
+        'scheduled_total_mw': 0.0,
+        'mcv_total_mw': 0.0,
+        'duration_hours': 0.0,
+        'rows': [],
+    }
+
+
+def filter_rows_by_time(rows: List[Dict[str, Any]], spec) -> List[Dict[str, Any]]:
+    """Filter DB rows so they respect the requested hour/slot selection."""
+
+    if spec.granularity == "quarter" or (spec.slots and len(spec.slots) > 0):
+        allowed_slots = set(spec.slots or range(1, 97))
+        filtered = []
+        for row in rows:
+            slot = _extract_int(row, ['slot_index', 'slot_no', 'slot'])
+            if slot is None:
+                block = _extract_int(row, ['block_index', 'block_no', 'delivery_block'])
+                if block is not None:
+                    slot = (max(1, block) - 1) * 4 + 1
+
+            if slot in allowed_slots:
+                filtered.append(row)
+        return filtered
+
+    allowed_hours = set(spec.hours or range(1, 25))
+    filtered = []
+    for row in rows:
+        block = _extract_int(row, ['block_index', 'block_no', 'delivery_block', 'hour_block'])
+        if block in allowed_hours:
+            filtered.append(row)
+    return filtered
+
+
+def compute_market_metrics(rows: List[Dict[str, Any]], spec) -> Dict[str, Any]:
+    """Calculate TWAP, extremes, bid totals, and volumes."""
+
+    prices_kwh: List[float] = []
+    minute_total = 0.0
+    price_weight = 0.0
+    volume_mwh = 0.0
+    purchase_total = 0.0
+    sell_total = 0.0
+    scheduled_total = 0.0
+    mcv_total = 0.0
+    default_duration = 15 if spec.granularity == "quarter" else 60
+
+    for row in rows:
+        duration_min = float(row.get('duration_min') or default_duration)
+        price_mwh = _extract_float(row, ['price_avg_rs_per_mwh', 'price_rs_per_mwh', 'price_rs_per_mw'])
+        price_kwh = price_mwh / 1000.0 if price_mwh else 0.0
+        duration_hours = duration_min / 60.0
+
+        prices_kwh.append(price_kwh)
+        price_weight += price_kwh * duration_min
+        minute_total += duration_min
+
+        scheduled_mw = _extract_float(row, ['scheduled_mw_sum', 'scheduled_mw', 'cleared_volume_mw'])
+        purchase_bid = _extract_float(row, ['purchase_bid_avg', 'purchase_bid', 'purchase_bid_sum'])
+        sell_bid = _extract_float(row, ['sell_bid_avg', 'sell_bid', 'sell_bid_sum'])
+        mcv = _extract_float(row, ['mcv_sum', 'mcv'])
+
+        volume_mwh += scheduled_mw * duration_hours
+        purchase_total += purchase_bid * duration_hours
+        sell_total += sell_bid * duration_hours
+        scheduled_total += scheduled_mw * duration_hours
+        mcv_total += mcv * duration_hours
+
+    twap = (price_weight / minute_total) if minute_total else 0.0
+    min_price = min(prices_kwh) if prices_kwh else 0.0
+    max_price = max(prices_kwh) if prices_kwh else 0.0
+
+    return {
+        'twap': twap,
+        'min_price': min_price,
+        'max_price': max_price,
+        'total_volume_gwh': volume_mwh / 1000.0,
+        'purchase_bid_total_mw': purchase_total,
+        'sell_bid_total_mw': sell_total,
+        'scheduled_total_mw': scheduled_total,
+        'mcv_total_mw': mcv_total,
+        'duration_hours': minute_total / 60.0,
+    }
+
+
+def _extract_int(row: Dict[str, Any], keys: List[str]) -> Optional[int]:
+    for key in keys:
+        value = row.get(key)
+        if value is None:
+            continue
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            continue
+    return None
+
+
+def _extract_float(row: Dict[str, Any], keys: List[str], default: float = 0.0) -> float:
+    for key in keys:
+        value = row.get(key)
+        if value is None:
+            continue
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            continue
+    return default
 
 
 async def build_complete_response(
     spec,
     primary_data: Dict[str, Any],
     all_market_data: Dict[str, Dict[str, Any]],
+    all_market_prev_year: Dict[str, Optional[Dict[str, Any]]],
+    selection_details: Dict[str, Any],
     user_query: str
 ) -> str:
-    """Build complete response with OpenAI insights."""
-    
-    # Market emoji
-    market_emoji = {"DAM": "📊", "GDAM": "🟢", "RTM": "🔵"}.get(spec.market, "📊")
-    
-    # Time range
-    time_range = format_time_range(spec.hours if spec.hours else list(range(1, 25)))
-    
-    # 1. Snapshot Card
-    date_str = spec.start_date.strftime("%d %b %Y")
-    
-    snapshot = f"""## {market_emoji} {spec.market} Snapshot - {date_str}
-{time_range}
+    """Build complete response with OpenAI insights and Tailwind-friendly HTML."""
 
-**TWAP Price**  
-₹{primary_data['twap']:.2f} /kWh
+    date_label = format_date_range(spec.start_date, spec.end_date)
+    market_badge = {"DAM": "📊 Spot Market (DAM)", "GDAM": "🟢 Spot Market (GDAM)", "RTM": "🔵 Spot Market (RTM)"}.get(spec.market, "📊 Spot Market")
 
-**Min / Max Block Price**  
-₹{primary_data['min_price']:.2f} / ₹{primary_data['max_price']:.2f} /kWh
+    hero = response_builder.build_overview_header(
+        market_badge=market_badge,
+        date_label=date_label,
+        selection_details=selection_details,
+        user_query=user_query,
+    )
 
-**Total Cleared Volume**  
-{primary_data['total_volume_gwh']:.1f} GWh
+    snapshot = response_builder.build_snapshot_card(
+        market=spec.market,
+        delivery_label=date_label,
+        time_window=selection_details['time_label'],
+        twap=primary_data.get('twap', 0.0),
+        min_price=primary_data.get('min_price', 0.0),
+        max_price=primary_data.get('max_price', 0.0),
+        total_volume_gwh=primary_data.get('total_volume_gwh', 0.0),
+    )
 
----
-"""
-    
-    # 2. Market Comparison Table
-    comparison = f"""## 📊 Market Comparison · {spec.start_date.year} vs {spec.start_date.year - 1}
-Volumes (GWh) and average prices (₹/kWh)
+    comparison = response_builder.build_market_comparison_section(
+        spec_year=spec.start_date.year,
+        current_year_data=all_market_data,
+        previous_year_data=all_market_prev_year,
+    )
 
-| Market | Volume {spec.start_date.year} | Volume {spec.start_date.year - 1} | Price {spec.start_date.year} | Price {spec.start_date.year - 1} | YoY Δ |
-|--------|------------------------------|------------------------------|------------------------------|------------------------------|--------|
-| 📊 DAM | {all_market_data.get('DAM', {}).get('total_volume_gwh', 0):.2f} GWh | 0.00 GWh | ₹{all_market_data.get('DAM', {}).get('twap', 0):.4f} /kWh | ₹0.0000 /kWh | — |
-| 🟢 GDAM | {all_market_data.get('GDAM', {}).get('total_volume_gwh', 0):.2f} GWh | 0.00 GWh | ₹{all_market_data.get('GDAM', {}).get('twap', 0):.4f} /kWh | ₹0.0000 /kWh | — |
-| 🔵 RTM | {all_market_data.get('RTM', {}).get('total_volume_gwh', 0):.2f} GWh | 0.00 GWh | ₹{all_market_data.get('RTM', {}).get('twap', 0):.4f} /kWh | ₹0.0000 /kWh | — |
+    bids = response_builder.build_bid_analysis_section(all_market_data)
 
----
-"""
-    
-    # 3. Bid Analysis Section - FIXED with correct values
-    dam_data = all_market_data.get('DAM', {})
-    gdam_data = all_market_data.get('GDAM', {})
-    rtm_data = all_market_data.get('RTM', {})
-    
-    dam_purchase = dam_data.get('purchase_bid_total_mw', 0)
-    dam_sell = dam_data.get('sell_bid_total_mw', 0)
-    dam_scheduled = dam_data.get('scheduled_total_mw', 0)
-    
-    gdam_purchase = gdam_data.get('purchase_bid_total_mw', 0)
-    gdam_sell = gdam_data.get('sell_bid_total_mw', 0)
-    gdam_scheduled = gdam_data.get('scheduled_total_mw', 0)
-    
-    rtm_purchase = rtm_data.get('purchase_bid_total_mw', 0)
-    rtm_sell = rtm_data.get('sell_bid_total_mw', 0)
-    rtm_scheduled = rtm_data.get('scheduled_total_mw', 0)
-    
-    # Calculate bid ratios
-    dam_ratio = dam_purchase / dam_sell if dam_sell > 0 else 0
-    gdam_ratio = gdam_purchase / gdam_sell if gdam_sell > 0 else 0
-    rtm_ratio = rtm_purchase / rtm_sell if rtm_sell > 0 else 0
-    
-    # Determine market tightness
-    avg_ratio = (dam_ratio + gdam_ratio + rtm_ratio) / 3 if (dam_ratio or gdam_ratio or rtm_ratio) else 0
-    if avg_ratio > 1.0:
-        tightness = "**Market Tightness: Slightly Tight** (Sell pressure exceeds buy)"
-    elif avg_ratio > 0.9:
-        tightness = "**Market Tightness: Balanced**"
-    else:
-        tightness = "**Market Tightness: Slightly Loose** (Sell pressure exceeds buy)"
-    
-    bid_analysis = f"""## 📊 Market Bids & Scheduling Analysis
-
-**PURCHASE BIDS (MW)**
-• **DAM:** {dam_purchase:,.0f} MW
-• **GDAM:** {gdam_purchase:,.0f} MW
-• **RTM:** {rtm_purchase:,.0f} MW
-
-**SELL BIDS (MW)**
-• **DAM:** {dam_sell:,.0f} MW
-• **GDAM:** {gdam_sell:,.0f} MW
-• **RTM:** {rtm_sell:,.0f} MW
-
-**SCHEDULED MW & BID RATIO**
-• **Scheduled:** DAM {dam_scheduled:,.0f} · GDAM {gdam_scheduled:,.0f} · RTM {rtm_scheduled:,.0f}
-• **Bid Ratio (Buy/Sell):** DAM {dam_ratio:.2f} · GDAM {gdam_ratio:.2f} · RTM {rtm_ratio:.2f}
-
-{tightness}
-
----
-"""
-    
-    # 4. OpenAI-Powered Insights
-    ai_insights = await generate_ai_insights(
+    insights_list = await generate_ai_insights(
         user_query,
         spec,
         primary_data,
-        all_market_data
+        all_market_data,
+        selection_details,
+        all_market_prev_year,
     )
-    
-    # Combine all sections
-    return f"{snapshot}{comparison}{bid_analysis}{ai_insights}"
+
+    insights = response_builder.build_ai_insights_section(insights_list)
+
+    return response_builder.compose_dashboard([
+        hero,
+        snapshot,
+        comparison,
+        bids,
+        insights,
+    ])
 
 
 async def generate_ai_insights(
     user_query: str,
     spec,
     primary_data: Dict[str, Any],
-    all_market_data: Dict[str, Dict[str, Any]]
-) -> str:
-    """Generate OpenAI-powered market insights."""
-    
+    all_market_data: Dict[str, Dict[str, Any]],
+    selection_details: Dict[str, Any],
+    all_market_prev_year: Dict[str, Optional[Dict[str, Any]]],
+) -> List[str]:
+    """Generate OpenAI-powered market insights as bullet points."""
+
+    fallback = build_default_insights(spec, all_market_data, selection_details)
+
     if not openai_client:
-        # Fallback to generic insights
-        return """## 🤖 EM-SPARK AI INSIGHTS
+        return fallback
 
-• **DAM prices remain moderate**, with intraday volatility driven by evening peak demand.
-
-• **GDAM continues to gain share**, reflecting strong renewable sell-side participation.
-
-• **RTM volumes and bid ratios indicate active balancing activity**, but with slightly loose overall market conditions.
-
----
-"""
-    
     try:
-        # Prepare market data for OpenAI
-        dam_price = all_market_data.get('DAM', {}).get('twap', 0)
-        gdam_price = all_market_data.get('GDAM', {}).get('twap', 0)
-        rtm_price = all_market_data.get('RTM', {}).get('twap', 0)
-        
-        dam_vol = all_market_data.get('DAM', {}).get('total_volume_gwh', 0)
-        gdam_vol = all_market_data.get('GDAM', {}).get('total_volume_gwh', 0)
-        rtm_vol = all_market_data.get('RTM', {}).get('total_volume_gwh', 0)
-        
-        # Calculate key metrics
-        if dam_price > 0 and gdam_price > 0:
-            gdam_premium = ((gdam_price - dam_price) / dam_price) * 100
-        else:
-            gdam_premium = 0
-        
-        prompt = f"""You are an expert energy market analyst. Analyze the following Indian energy market data and provide 3-4 concise, actionable insights in bullet points.
+        def fmt_market_line(market: str) -> str:
+            data = all_market_data.get(market, {})
+            prev = (all_market_prev_year.get(market) or {}) if all_market_prev_year else {}
+            price = data.get('twap', 0.0)
+            volume = data.get('total_volume_gwh', 0.0)
+            prev_price = prev.get('twap', 0.0)
+            prev_volume = prev.get('total_volume_gwh', 0.0)
+            yoy = ((price - prev_price) / prev_price * 100) if prev_price else 0.0
+            return (
+                f"- {market} price ₹{price:.2f}/kWh (YoY {yoy:+.1f}%), "
+                f"volume {volume:.1f} GWh (prev {prev_volume:.1f} GWh)"
+            )
 
-Market Data for {spec.start_date.strftime('%d %b %Y')}:
-- DAM Price: ₹{dam_price:.4f}/kWh, Volume: {dam_vol:.1f} GWh
-- GDAM Price: ₹{gdam_price:.4f}/kWh, Volume: {gdam_vol:.1f} GWh (GDAM Premium: {gdam_premium:+.1f}%)
-- RTM Price: ₹{rtm_price:.4f}/kWh, Volume: {rtm_vol:.1f} GWh
+        summary_lines = "\n".join(fmt_market_line(m) for m in ["DAM", "GDAM", "RTM"])
 
-Purchase Bids (MW):
-- DAM: {all_market_data.get('DAM', {}).get('purchase_bid_total_mw', 0):,.0f}
-- GDAM: {all_market_data.get('GDAM', {}).get('purchase_bid_total_mw', 0):,.0f}
-- RTM: {all_market_data.get('RTM', {}).get('purchase_bid_total_mw', 0):,.0f}
+        bid_summary = "\n".join(
+            f"- {m}: buy {all_market_data.get(m, {}).get('purchase_bid_total_mw', 0):,.0f} MW, sell {all_market_data.get(m, {}).get('sell_bid_total_mw', 0):,.0f} MW"
+            for m in ["DAM", "GDAM", "RTM"]
+        )
 
-Provide insights on:
-1. Price trends and volatility
-2. Volume patterns
-3. GDAM vs DAM comparison (is GDAM cheaper or more expensive? By how much?)
-4. Procurement recommendations
+        prompt = f"""You are an expert energy market analyst for India's power exchanges.
 
-Format as bullet points starting with "•". Keep each point to 1-2 sentences. Be specific with numbers."""
+User query: {user_query}
+Delivery window: {selection_details['time_label']} ({selection_details['duration_hours']} hrs)
+
+Market snapshots:\n{summary_lines}
+
+Bid stack summary:\n{bid_summary}
+
+Provide four crisp insights covering price trends, volume signals, GDAM vs DAM premium/discount, and procurement guidance. Each bullet must start with an emoji or bold tag, be data-driven, and stay under two sentences."""
 
         print("📤 Calling OpenAI for insights...")
-        
         response = openai_client.chat.completions.create(
-            model="gpt-4o-mini",  # Using cost-effective model
+            model="gpt-4o-mini",
             messages=[
                 {"role": "system", "content": "You are an expert energy market analyst providing concise, data-driven insights."},
-                {"role": "user", "content": prompt}
+                {"role": "user", "content": prompt},
             ],
-            temperature=0.7,
-            max_tokens=300
+            temperature=0.6,
+            max_tokens=320,
         )
-        
-        insights_text = response.choices[0].message.content.strip()
-        
+
+        raw_text = response.choices[0].message.content.strip()
+        bullets = parse_bullets(raw_text)
         print(f"✓ OpenAI insights generated (tokens: {response.usage.total_tokens})")
-        
-        return f"""## 🤖 EM-SPARK AI INSIGHTS
+        return bullets or fallback
 
-{insights_text}
-
----
-"""
-    
     except Exception as e:
         print(f"⚠️  OpenAI API error: {e}")
-        # Fallback to generic insights
-        return """## 🤖 EM-SPARK AI INSIGHTS
+        return fallback
 
-• **DAM prices remain moderate**, with intraday volatility driven by evening peak demand.
 
-• **GDAM continues to gain share**, reflecting strong renewable sell-side participation.
+def build_default_insights(spec, all_market_data, selection_details) -> List[str]:
+    dam = all_market_data.get('DAM', {})
+    gdam = all_market_data.get('GDAM', {})
+    rtm = all_market_data.get('RTM', {})
 
-• **RTM volumes and bid ratios indicate active balancing activity**.
+    dam_price = dam.get('twap', 0.0)
+    gdam_price = gdam.get('twap', 0.0)
+    rtm_price = rtm.get('twap', 0.0)
 
----
-"""
+    dam_vol = dam.get('total_volume_gwh', 0.0)
+    gdam_vol = gdam.get('total_volume_gwh', 0.0)
+    rtm_vol = rtm.get('total_volume_gwh', 0.0)
+
+    gdam_premium = ((gdam_price - dam_price) / dam_price * 100) if dam_price else 0.0
+
+    return [
+        f"📊 DAM TWAP at ₹{dam_price:.2f}/kWh with {dam_vol:.1f} GWh cleared across {selection_details['time_label']}.",
+        f"🟢 GDAM is {gdam_premium:+.1f}% vs DAM (₹{gdam_price:.2f}/kWh) with {gdam_vol:.1f} GWh of green energy.",
+        f"🔵 RTM balances the grid at ₹{rtm_price:.2f}/kWh and {rtm_vol:.1f} GWh, signalling intraday volatility.",
+        "🧭 Diversify procurement across DAM for value, GDAM for renewable tags, and RTM for fine-tuning schedules.",
+    ]
+
+
+def parse_bullets(text: str) -> List[str]:
+    bullets: List[str] = []
+    for line in text.splitlines():
+        stripped = line.strip()
+        if not stripped:
+            continue
+        if stripped[0] in {'•', '-', '*'}:
+            stripped = stripped[1:].strip()
+        bullets.append(stripped)
+    if not bullets and text.strip():
+        bullets.append(text.strip())
+    return bullets
+
+
+def describe_time_selection(spec) -> Dict[str, Any]:
+    if spec.granularity == "quarter" and spec.slots:
+        slots = sorted(set(spec.slots))
+        time_label, index_label, count = label_slot_ranges(slots)
+        duration_hours = count * 0.25
+        pretty_label = f"{time_label} hrs (All India)"
+    else:
+        hours = sorted(set(spec.hours or list(range(1, 25))))
+        time_label, index_label, count = label_hour_ranges(hours)
+        if count >= 24:
+            pretty_label = "00:00–24:00 hrs (All India)"
+        else:
+            pretty_label = f"{time_label} hrs (All India)"
+        duration_hours = float(count)
+
+    return {
+        'time_label': pretty_label,
+        'index_label': index_label,
+        'duration_hours': round(duration_hours, 2),
+    }
+
+
+def format_date_range(start: date, end: date) -> str:
+    if start == end:
+        return start.strftime("%d %b %Y")
+    if start.year == end.year:
+        if start.month == end.month:
+            return f"{start.strftime('%d')}–{end.strftime('%d %b %Y')}"
+        return f"{start.strftime('%d %b')} – {end.strftime('%d %b %Y')}"
+    return f"{start.strftime('%d %b %Y')} – {end.strftime('%d %b %Y')}"
+
+
+def clone_spec_for_market(spec, market: str):
+    return replace(spec, market=market)
+
+
+def shift_spec_by_year(spec, years: int):
+    if not spec:
+        return None
+    start = _shift_date_safe(spec.start_date, years)
+    end = _shift_date_safe(spec.end_date, years)
+    if not start or not end:
+        return None
+    return replace(spec, start_date=start, end_date=end)
+
+
+def _shift_date_safe(original: date, years: int) -> Optional[date]:
+    try:
+        return original.replace(year=original.year + years)
+    except ValueError:
+        if original.month == 2 and original.day == 29:
+            return original.replace(year=original.year + years, day=28)
+        return None
 
 
 async def send_error_message(query: str):
