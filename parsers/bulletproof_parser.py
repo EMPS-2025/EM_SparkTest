@@ -4,14 +4,13 @@
 from __future__ import annotations
 
 import re
-from datetime import date
-from typing import List, Tuple
-
+from datetime import date, timedelta
+from typing import List, Tuple, Optional
 from core.models import QuerySpec
+
 from parsers.date_parser import DateParser
 from parsers.time_parser import TimeParser
 from utils.text_utils import normalize_text
-
 
 class BulletproofParser:
     """High-confidence parser with layered deterministic fallbacks."""
@@ -24,6 +23,7 @@ class BulletproofParser:
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
+    
     def parse(self, query: str) -> List[QuerySpec]:
         """Parse user query into one or more QuerySpec objects."""
 
@@ -122,9 +122,10 @@ class BulletproofParser:
             text,
             flags=re.I,
         )
-
+        
         periods: List[Tuple[date, date]] = []
         for day_str, month_str, year_str in matches:
+
             try:
                 month = DateParser.MONTHS[month_str.lower()[:3]]
                 year = self._normalize_year(year_str)
@@ -148,10 +149,11 @@ class BulletproofParser:
                 month = DateParser.MONTHS[month_str.lower()[:3]]
                 year = int(year_str)
                 start = date(year, month, 1)
+                
                 import calendar
-
                 last_day = calendar.monthrange(year, month)[1]
                 end = date(year, month, last_day)
+                
                 periods.append((start, end))
             except Exception:
                 continue
@@ -180,7 +182,7 @@ class BulletproofParser:
                 unique.append(spec)
 
         return unique
-
+    
     def _default_spec(self) -> QuerySpec:
         today = date.today()
         return QuerySpec(
@@ -190,9 +192,9 @@ class BulletproofParser:
             granularity="hour",
             hours=list(range(1, 25)),
             slots=None,
-            stat="twap",
+            stat="twap"
         )
-
+    
     @staticmethod
     def _normalize_year(year_str: str) -> int:
         year = int(year_str)
@@ -200,6 +202,10 @@ class BulletproofParser:
             year += 2000
         return year
 
+
+# ═══════════════════════════════════════════════════════════════
+# Test the parser
+# ═══════════════════════════════════════════════════════════════
 
 if __name__ == "__main__":
     # Quick smoke test
@@ -215,6 +221,7 @@ if __name__ == "__main__":
         "RTM yesterday",
         "Prices between 12 Nov 2024 to 15 Nov 2024 8-9 hrs",
     ]
+    
     for q in tests:
         print(q)
         for spec in parser.parse(q):
